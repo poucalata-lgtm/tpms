@@ -86,6 +86,8 @@ canvas { width: 100%; height: 180px; display: block }
       <span class="pair"><label for="acc">Acelerómetro</label>
       <select id="acc"><option value="0" selected>Desactivado</option><option value="10">10 Hz</option><option value="25">25 Hz</option><option value="50">50 Hz</option><option value="100">100 Hz (máx.)</option></select></span>
       <span class="pair"><label for="atm">Atmosférica (hPa)</label><input id="atm" type="number" step="0.1" value="1013.2"></span>
+      <span class="pair"><label for="smooth">Suavizado Excel</label>
+      <select id="smooth"><option value="0.5">0,5 s</option><option value="1" selected>1 s</option><option value="2">2 s</option></select></span>
     </div>
     <p class="note" id="accinfo" hidden></p>
     <div class="row">
@@ -304,7 +306,7 @@ function updateCount() {
 $("acc").onchange = () => { startAcc(+$("acc").value); savePrefs(); };
 
 function savePrefs() {
-  try { localStorage.setItem("tpmsPrefs", JSON.stringify({ poll: $("poll").value, acc: $("acc").value, atmHpa: $("atm").value })); } catch (e) {}
+  try { localStorage.setItem("tpmsPrefs", JSON.stringify({ poll: $("poll").value, acc: $("acc").value, atmHpa: $("atm").value, smooth: $("smooth").value })); } catch (e) {}
 }
 function loadPrefs() {
   try {
@@ -312,9 +314,11 @@ function loadPrefs() {
     if (p.poll) $("poll").value = p.poll;
     if (p.acc) $("acc").value = p.acc;
     if (p.atmHpa) $("atm").value = p.atmHpa;
+    if (p.smooth) $("smooth").value = p.smooth;
   } catch (e) {}
 }
 $("atm").onchange = savePrefs;
+$("smooth").onchange = savePrefs;
 
 W.forEach(w => {
   $("c" + w.i).onclick = () => {
@@ -388,6 +392,22 @@ $("xlsx").onclick = async () => {
     const Acc = A.rows.map(r => ({ ms: +r[1], x: +r[2], y: +r[3], z: +r[4], m: +r[5] }));
     if (!P.length && !Acc.length) { log("No hay datos grabados"); return; }
     P.sort((a, b) => a.ms - b.ms); Acc.sort((a, b) => a.ms - b.ms);
+
+    // Presión suavizada: media móvil centrada (por rueda) sobre la presión absoluta
+    const winS = +$("smooth").value, half = winS * 500;
+    ["delantera", "trasera"].forEach(wn => {
+      const arr = P.filter(p => p.wheel === wn);
+      let a = 0, b = 0, sum = 0;
+      arr.forEach(p => {
+        while (b < arr.length && arr[b].ms <= p.ms + half) { sum += arr[b].abs; b++; }
+        while (arr[a].ms < p.ms - half) { sum -= arr[a].abs; a++; }
+        p.nS = b - a;
+        p.absS = +(sum / p.nS).toFixed(2);
+        const manS = p.absS - p.atm / 10;
+        p.barS = +(manS / 100).toFixed(4);
+        p.psiS = +(manS * 0.1450377).toFixed(3);
+      });
+    });
     const t0 = Math.min(P.length ? P[0].ms : Infinity, Acc.length ? Acc[0].ms : Infinity);
     const t = ms => +((ms - t0) / 1000).toFixed(3);
 
@@ -395,8 +415,8 @@ $("xlsx").onclick = async () => {
     // La presión de cada rueda es el último valor recibido hasta ese instante; *_edad_ms es su antigüedad.
     const head = ["hora_local", "epoch_ms", "t_s"];
     if (Acc.length) head.push("ax_ms2", "ay_ms2", "az_ms2", "a_total_ms2");
-    head.push("del_p_man_bar", "del_p_man_psi", "del_p_abs_kpa", "del_temp_c", "del_edad_ms",
-              "tras_p_man_bar", "tras_p_man_psi", "tras_p_abs_kpa", "tras_temp_c", "tras_edad_ms");
+    head.push("del_p_man_bar", "del_p_man_psi", "del_p_man_suav_bar", "del_p_man_suav_psi", "del_p_abs_kpa", "del_temp_c", "del_edad_ms",
+              "tras_p_man_bar", "tras_p_man_psi", "tras_p_man_suav_bar", "tras_p_man_suav_psi", "tras_p_abs_kpa", "tras_temp_c", "tras_edad_ms");
     const sync = [head];
     const base = Acc.length ? Acc : P;
     const last = { delantera: null, trasera: null };
@@ -406,12 +426,15 @@ $("xlsx").onclick = async () => {
       const row = [localTime(s.ms), s.ms, t(s.ms)];
       if (Acc.length) row.push(s.x, s.y, s.z, s.m);
       [last.delantera, last.trasera].forEach(p => row.push(
-        p ? p.bar : null, p ? p.psi : null, p ? p.abs : null, p ? p.t : null, p ? s.ms - p.ms : null));
+        p ? p.bar : null, p ? p.psi : null, p ? p.barS : null, p ? p.psiS : null,
+        p ? p.abs : null, p ? p.t : null, p ? s.ms - p.ms : null));
       sync.push(row);
     });
 
-    const pres = [["hora_local", "epoch_ms", "t_s", "rueda", "p_abs_kpa", "p_atm_hpa", "p_man_kpa", "p_man_bar", "p_man_psi", "temp_c", "bateria_mv", "latencia_ms"]]
-      .concat(P.map(p => [localTime(p.ms), p.ms, t(p.ms), p.wheel, p.abs, p.atm, p.man, p.bar, p.psi, p.t, p.v, p.lat]));
+    const pres = [["hora_local", "epoch_ms", "t_s", "rueda", "p_abs_kpa", "p_atm_hpa", "p_man_kpa", "p_man_bar", "p_man_psi",
+                   "p_abs_suav_kpa", "p_man_suav_bar", "p_man_suav_psi", "n_suav", "temp_c", "bateria_mv", "latencia_ms"]]
+      .concat(P.map(p => [localTime(p.ms), p.ms, t(p.ms), p.wheel, p.abs, p.atm, p.man, p.bar, p.psi,
+                          p.absS, p.barS, p.psiS, p.nS, p.t, p.v, p.lat]));
     const acc = [["hora_local", "epoch_ms", "t_s", "ax_ms2", "ay_ms2", "az_ms2", "a_total_ms2"]]
       .concat(Acc.map(a => [localTime(a.ms), a.ms, t(a.ms), a.x, a.y, a.z, a.m]));
     const pollTxt = $("poll").selectedOptions[0].textContent, accTxt = $("acc").selectedOptions[0].textContent;
@@ -426,6 +449,7 @@ $("xlsx").onclick = async () => {
       ["Presión atmosférica usada (hPa)", P.length ? P[P.length - 1].atm : (atm() * 10)],
       ["Sensor", "RideNow TPMS T1: presión absoluta, resolución 1 kPa; manométrica = absoluta − atmosférica"],
       ["Sincronización", "Hoja Sincronizado: cada fila es una muestra del acelerómetro; la presión de cada rueda es el último valor recibido (retención de muestra) y *_edad_ms su antigüedad"],
+      ["Suavizado", "Columnas *_suav: media móvil centrada de " + String(winS).replace(".", ",") + " s por rueda sobre la presión absoluta; n_suav = muestras dentro de la ventana (si es 1, no hay suavizado)"],
       ["Acelerómetro", "Del móvil, m/s² con gravedad, ejes del teléfono; Chrome lo redondea a 0,1 m/s²"],
       ["Generado con", location.href]
     ];
