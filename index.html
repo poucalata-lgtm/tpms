@@ -44,6 +44,8 @@ button.primary { background: var(--fg); color: var(--bg); border-color: var(--fg
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--front); outline-offset: 2px }
 button:disabled { opacity: .45; cursor: default }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+.pair { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap }
+.pair label { min-width: 7.5em }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 10px; min-width: 0 }
 .panel h3 { margin: 0; font-size: .8rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted) }
 label { font-size: .85rem; color: var(--muted); display: flex; gap: 6px; align-items: center }
@@ -79,14 +81,18 @@ canvas { width: 100%; height: 180px; display: block }
   <section class="panel">
     <h3>Registro</h3>
     <div class="row">
-      <label for="poll">Lectura cada</label>
-      <select id="poll"><option value="1">1 s</option><option value="2">2 s</option><option value="3" selected>3 s</option><option value="5">5 s</option><option value="10">10 s</option></select>
-      <label for="atm">Atmosférica (kPa)</label><input id="atm" type="number" step="0.1" value="101.3">
+      <span class="pair"><label for="poll">Presión cada</label>
+      <select id="poll"><option value="0.25">0,25 s</option><option value="0.5">0,5 s</option><option value="1">1 s</option><option value="2">2 s</option><option value="3" selected>3 s</option><option value="5">5 s</option><option value="10">10 s</option></select></span>
+      <span class="pair"><label for="acc">Acelerómetro</label>
+      <select id="acc"><option value="0" selected>Desactivado</option><option value="10">10 Hz</option><option value="25">25 Hz</option><option value="50">50 Hz</option><option value="100">100 Hz (máx.)</option></select></span>
+      <span class="pair"><label for="atm">Atmosférica (kPa)</label><input id="atm" type="number" step="0.1" value="101.3"></span>
     </div>
+    <p class="note" id="accinfo" hidden></p>
     <div class="row">
       <button id="rec" class="primary">Empezar a grabar</button>
-      <button id="csv" disabled>Descargar CSV</button>
-      <button id="copy" disabled>Copiar CSV</button>
+      <button id="csv" disabled>CSV presión</button>
+      <button id="csvacc" disabled hidden>CSV acelerómetro</button>
+      <button id="copy" disabled>Copiar CSV presión</button>
       <span class="note" id="count">0 muestras</span>
     </div>
     <canvas id="chart" aria-label="Presión manométrica en el tiempo"></canvas>
@@ -94,6 +100,7 @@ canvas { width: 100%; height: 180px; display: block }
   </section>
 
   <p class="note">Cada rueda se conecta por separado. En la lista de Chrome los dos sensores salen como «TSTPMS»: para no confundirlos, conecta la delantera con solo ese sensor despierto (gira esa rueda) y luego la trasera. Cierra la app Tireo y apaga el Garmin: el sensor solo acepta una conexión.</p>
+  <p class="note">El acelerómetro es el del móvil (m/s², con gravedad, en los ejes del teléfono) y se guarda en un CSV aparte, sincronizable con el de presión por la columna epoch_ms. Solo registra con la pantalla encendida: para rugosidad del firme, monta el móvil fijo en el manillar.</p>
   <p class="note" id="support"></p>
 </main>
 
@@ -134,9 +141,9 @@ function parse(w, dv) {
   setStatus(w, "en directo", "on");
   if (recording) {
     const now = new Date();
-    rows.push([now.toISOString(), w.name, w.abs, atm().toFixed(1), g.toFixed(1), (g / 100).toFixed(3), (g * 0.1450377).toFixed(2), w.t, w.v]);
+    rows.push([now.toISOString(), now.getTime(), w.name, w.abs, atm().toFixed(1), g.toFixed(1), (g / 100).toFixed(3), (g * 0.1450377).toFixed(2), w.t, w.v]);
     series[w.i].push([now.getTime(), g / 100]);
-    $("count").textContent = rows.length + " muestras";
+    updateCount();
     $("csv").disabled = $("copy").disabled = false;
     draw();
   }
@@ -188,12 +195,101 @@ async function poll(w) {
 
 function restartTimer() {
   clearInterval(timer);
+  const sec = +$("poll").value;
   timer = setInterval(() => {
     W.forEach(w => {
       poll(w);
-      if (w.last && Date.now() - w.last > 4000 * +$("poll").value && w.tx) setStatus(w, "sin datos", "wait");
+      if (w.last && Date.now() - w.last > Math.max(3000, 4000 * sec) && w.tx) setStatus(w, "sin datos", "wait");
     });
-  }, 1000 * +$("poll").value);
+  }, 1000 * sec);
+}
+
+// ---------- Acelerómetro del móvil (opcional) ----------
+// Generic Sensor API si existe (pide la frecuencia al sistema); si no, devicemotion diezmado.
+// Valores en m/s² incluyendo la gravedad, en los ejes del móvil.
+const A = { hz: 0, sensor: null, motion: null, minDt: 0, lastT: 0, rows: [], n: 0, n0: 0, t0: 0, win: [] };
+
+function onAcc(x, y, z, epochMs) {
+  if (x == null || y == null || z == null) return;
+  const mag = Math.sqrt(x * x + y * y + z * z);
+  A.n++;
+  A.win.push([epochMs, mag]);
+  while (A.win.length && epochMs - A.win[0][0] > 1000) A.win.shift();
+  if (recording) {
+    A.rows.push([new Date(epochMs).toISOString(), Math.round(epochMs), x.toFixed(3), y.toFixed(3), z.toFixed(3), mag.toFixed(3)]);
+  }
+}
+
+function stopAcc() {
+  if (A.sensor) { try { A.sensor.stop(); } catch (e) {} A.sensor = null; }
+  if (A.motion) { window.removeEventListener("devicemotion", A.motion); A.motion = null; }
+  A.hz = 0; A.win = [];
+  $("accinfo").hidden = true;
+}
+
+function startAcc(hz) {
+  stopAcc();
+  if (!hz) return;
+  A.hz = hz; A.n = 0; A.n0 = 0; A.t0 = performance.now();
+  $("accinfo").hidden = false; $("accinfo").textContent = "Acelerómetro: arrancando…";
+  if ("Accelerometer" in window) {
+    try {
+      const s = new Accelerometer({ frequency: hz });
+      s.addEventListener("reading", () => onAcc(s.x, s.y, s.z, performance.timeOrigin + s.timestamp));
+      s.addEventListener("error", e => { log("Acelerómetro: " + e.error.name + ", uso devicemotion"); startMotion(hz); });
+      s.start(); A.sensor = s;
+      return;
+    } catch (e) { log("Acelerómetro: " + e.message + ", uso devicemotion"); }
+  }
+  startMotion(hz);
+}
+
+function startMotion(hz) {
+  if (A.sensor) { try { A.sensor.stop(); } catch (e) {} A.sensor = null; }
+  A.minDt = 1000 / hz * 0.9; A.lastT = 0;
+  A.motion = e => {
+    const a = e.accelerationIncludingGravity; if (!a) return;
+    const now = performance.now();
+    if (now - A.lastT < A.minDt) return;
+    A.lastT = now;
+    onAcc(a.x, a.y, a.z, performance.timeOrigin + now);
+  };
+  window.addEventListener("devicemotion", A.motion);
+}
+
+// Frecuencia real y vibración (RMS de |a| en el último segundo), cada segundo
+setInterval(() => {
+  if (!A.hz) return;
+  const now = performance.now(), dt = (now - A.t0) / 1000;
+  const realHz = dt > 0 ? (A.n - A.n0) / dt : 0;
+  A.n0 = A.n; A.t0 = now;
+  let rms = 0;
+  if (A.win.length > 1) {
+    const m = A.win.reduce((s, p) => s + p[1], 0) / A.win.length;
+    rms = Math.sqrt(A.win.reduce((s, p) => s + (p[1] - m) ** 2, 0) / A.win.length);
+  }
+  $("accinfo").textContent = A.n === 0
+    ? "Acelerómetro: sin datos (¿Chrome en Android y página por https?)"
+    : "Acelerómetro: " + realHz.toFixed(1).replace(".", ",") + " Hz reales · vibración (RMS 1 s) " + rms.toFixed(2).replace(".", ",") + " m/s²";
+  updateCount();
+}, 1000);
+
+function updateCount() {
+  $("count").textContent = rows.length + " muestras de presión" + (A.rows.length ? " · " + A.rows.length + " de acelerómetro" : "");
+  if (A.rows.length) { $("csvacc").hidden = false; $("csvacc").disabled = false; }
+}
+
+$("acc").onchange = () => { startAcc(+$("acc").value); savePrefs(); };
+
+function savePrefs() {
+  try { localStorage.setItem("tpmsPrefs", JSON.stringify({ poll: $("poll").value, acc: $("acc").value })); } catch (e) {}
+}
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem("tpmsPrefs") || "{}");
+    if (p.poll) $("poll").value = p.poll;
+    if (p.acc) $("acc").value = p.acc;
+  } catch (e) {}
 }
 
 W.forEach(w => {
@@ -208,7 +304,7 @@ W.forEach(w => {
     $("atm").value = w.abs; log("Atmosférica = " + w.abs + " kPa (lectura del sensor " + w.name + ")");
   };
 });
-$("poll").onchange = restartTimer;
+$("poll").onchange = () => { restartTimer(); savePrefs(); };
 
 $("rec").onclick = async () => {
   recording = !recording;
@@ -219,7 +315,7 @@ $("rec").onclick = async () => {
     log("Grabando");
   } else {
     try { await wakeLock?.release(); } catch (e) {}
-    log("Grabación parada (" + rows.length + " muestras)");
+    log("Grabación parada (" + rows.length + " muestras de presión, " + A.rows.length + " de acelerómetro)");
   }
 };
 document.addEventListener("visibilitychange", async () => {
@@ -227,16 +323,22 @@ document.addEventListener("visibilitychange", async () => {
 });
 
 function csvText() {
-  const head = "timestamp_utc,rueda,p_abs_kpa,p_atm_kpa,p_man_kpa,p_man_bar,p_man_psi,temp_c,bateria_mv";
+  const head = "timestamp_utc,epoch_ms,rueda,p_abs_kpa,p_atm_kpa,p_man_kpa,p_man_bar,p_man_psi,temp_c,bateria_mv";
   return head + "\n" + rows.map(r => r.join(",")).join("\n") + "\n";
 }
-$("csv").onclick = () => {
-  const blob = new Blob([csvText()], { type: "text/csv" });
+function accCsvText() {
+  const head = "timestamp_utc,epoch_ms,ax_ms2,ay_ms2,az_ms2,a_total_ms2";
+  return head + "\n" + A.rows.map(r => r.join(",")).join("\n") + "\n";
+}
+function saveFile(text, prefix) {
+  const blob = new Blob([text], { type: "text/csv" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "tpms_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".csv";
+  a.download = prefix + "_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".csv";
   a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-};
+}
+$("csv").onclick = () => saveFile(csvText(), "tpms");
+$("csvacc").onclick = () => saveFile(accCsvText(), "acel");
 $("copy").onclick = async () => {
   try { await navigator.clipboard.writeText(csvText()); log("CSV copiado"); }
   catch (e) { log("No se pudo copiar: usa Descargar CSV"); }
@@ -275,7 +377,9 @@ function draw() {
   });
 }
 window.addEventListener("resize", draw);
+loadPrefs();
 restartTimer();
+startAcc(+$("acc").value);
 </script>
 </body>
 </html>
